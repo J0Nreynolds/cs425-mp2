@@ -383,8 +383,12 @@ void eventual_send(const char* message, int len, int num_replicas){
     //Increment this process's timestamp
     processes[process_id].timestamp += 1;
     message_counter+=1;
+    std::thread t(delayed_usend, message, len, processes[process_id].server_fd);
+    t.detach();
+    num_replicas-=1;
     for(auto kv : processes){
         int dest = kv.first;
+        if (dest == process_id) continue;
         struct connection info = kv.second;
         if(info.server_fd == -1) continue;
         std::cout << KRED << "Sent \"" << message << "\" to process " << dest << ", system time is " << get_time() << RST << std::endl;
@@ -545,13 +549,10 @@ void kvstore_receive(struct message m){
                 dict[m.text[1]].time = m.time;
             // Ack
             if(m.pid == process_id){
-                if(is_causally_ordered){
-                    dict[m.text[1]].time = m.time;
-                    ofs << 425 << ',' << process_id << ',' << "put" << ',' << m.text[1] << ',' << get_ms() << ',' << "resp" <<  ',' << dict[m.text[1]].value<< std::endl;
-                }
-                else {
+                if(!is_causally_ordered)
                     ofs << 425 << ',' << process_id << ',' << "put" << ',' << m.text[1] << ',' << counter << ',' << "resp" <<  ',' << dict[m.text[1]].value << std::endl;
-                }
+                else
+                    ofs << 425 << ',' << process_id << ',' << "put" << ',' << m.text[1] << ',' << get_ms() << ',' << "resp" <<  ',' << dict[m.text[1]].value << std::endl;
             }
         }
     }
@@ -561,7 +562,7 @@ void kvstore_receive(struct message m){
             if(m.time > reply_dict[m.id].time){
                 reply_dict[m.id].time = m.time;
                 reply_dict[m.id].value = m.value;
-                std::cout << "Updated reply : {" << reply_dict[m.id].num << "," << reply_dict[m.id].value << "," << reply_dict[m.id].time << std::endl;
+                std::cout << "Updated reply : {" << reply_dict[m.id].num << "," << reply_dict[m.id].value << "," << reply_dict[m.id].time << "}" << std::endl;
             }
             if(reply_dict[m.id].num == R){
                 ofs << 425 << ',' << process_id << ',' << "get" << ',' << m.text[1] << ',' << get_ms() << ',' << "resp" <<  ',' << reply_dict[m.id].value << std::endl;
