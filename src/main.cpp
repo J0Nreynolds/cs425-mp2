@@ -5,6 +5,7 @@
 #include <mutex>
 #include <chrono>
 
+#include <stdio.h>
 #include <signal.h>
 #include <time.h>
 #include <sys/types.h>
@@ -37,6 +38,8 @@ struct message {
     int pid;
     int* V;
     int id;
+    int value;
+    __int64_t time;
 };
 
 std::unordered_map<unsigned int, struct connection> processes;
@@ -52,13 +55,29 @@ static int kq;
 static int event_idx = 0;
 static struct kevent* chlist;
 static struct kevent* evlist;
-static const struct timespec tmout = { 0, 0 };  /* return immediately if no new events */
+static const struct timespec tmout = { 0, 100000000 };  /* return after 100ms */
 static int max_delay, min_delay = 0;
 static bool is_causally_ordered = false;
 
 static int counter = 0;
 static int message_counter = 0;
 static bool sequencer = false;
+
+static bool kvstore = false;
+std::ofstream ofs;
+int W, R;
+struct valtime {
+    int value;
+    __int64_t time;
+};
+std::unordered_map<char, struct valtime> dict;
+struct reply {
+    int num;
+    int value;
+    __int64_t time;
+};
+std::unordered_map<int, struct reply> reply_dict;
+
 
 /**
  * Initializes the unordered_map holding the information needed to connect to each process.
@@ -167,15 +186,15 @@ char* create_message(const char* message, int len, char protocol){
  * Thread function for sending delayed unicast message. Sends particular protocol header and
  * increments necessary counter.
  */
-void delayed_usend(std::string message, int fd)
+void delayed_usend(const char* cstr_message, int len, int fd)
 {
     //Format message
-    char* formatted_message = create_message(message.c_str(), message.size()+1, 'u');
+    char* formatted_message = create_message(cstr_message, len+1, 'u');
     int delay = rand()%(max_delay - min_delay) + min_delay;
     //Sleep if not sending to self
     if(fd_info[fd].pid != process_id) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
     //Write message to socket
-    write_all_to_socket(fd, formatted_message, message.size()+1 + sizeof(char) + sizeof(int));
+    write_all_to_socket(fd, formatted_message, len+1 + sizeof(char) + sizeof(int));
     delete[] formatted_message;
 }
 
@@ -183,10 +202,8 @@ void delayed_usend(std::string message, int fd)
  * Thread function for sending delayed multicast message. Sends particular protocol header and
  * increments necessary counter.
  */
-void delayed_msend(std::string message, int fd)
+void delayed_msend(const char* cstr_message, int len, int fd)
 {
-    const char* cstr_message = message.c_str();
-    int len = message.size()+1;
     char* formatted_message;
     if(is_causally_ordered){
         // Write the vector timestamp
@@ -205,9 +222,10 @@ void delayed_msend(std::string message, int fd)
         // Write the message id
         char* output = new char[len + sizeof(int)];
         int id = message_counter;
+
         memcpy(output, &id, sizeof(int));
+        memcpy(output + sizeof(int), (void*) cstr_message, len);
         // Write the message
-        memcpy(output + sizeof(int), cstr_message, len);
         len = sizeof(int) + len;
         formatted_message = create_message(output, len, 'm');
         delete[] output;
@@ -217,10 +235,45 @@ void delayed_msend(std::string message, int fd)
     //Sleep if not sending to self
     if(fd_info[fd].pid != process_id) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
     //Write message to socket
-    write_all_to_socket(fd, formatted_message, len + sizeof(char) + sizeof(int));
+    len = len + sizeof(int) + sizeof(char);
+    write_all_to_socket(fd, formatted_message, len);
     delete[] formatted_message;
 }
 
+void simulate_delay(int delay){
+}
+
+void delay(int delay){
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+}
+
+void dump(){
+    for(auto kv : dict){
+        char key = kv.first;
+        struct valtime vt = kv.second;
+        std::cout << KCYN << "{" << key << ", " << vt.value << "}" << RST << std::endl;
+    }
+}
+
+std::string get_time(){
+    __int64_t ms_past_epoch = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
+    __int64_t seconds_past_epoch = time(0);
+    int ms = ms_past_epoch - seconds_past_epoch*1000;
+    time_t theTime = time(NULL);
+    struct tm *aTime = localtime(&theTime);
+    int hour=aTime->tm_hour;
+    int min=aTime->tm_min;
+    int sec=aTime->tm_sec;
+
+    std::ostringstream oss;
+    oss << hour <<":"<< (min<10 ? "0" : "") << min <<":"<< (sec<10 ? "0" : "")  << sec <<":"<< (ms<10 ? "0" : "") << ms;
+    return oss.str();
+}
+
+__int64_t get_ms(){
+    __int64_t ms_past_epoch = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
+    return ms_past_epoch;
+}
 
 /**
  * Thread function for sending delayed sequencer message. Sends particular protocol header and
@@ -252,38 +305,22 @@ void delayed_sequencer_msend(int message_id, int fd, int pid){
  * Receives a unicast message
  */
 void unicast_receive(int source, std::string message){
-    __int64_t ms_past_epoch = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
-    __int64_t seconds_past_epoch = time(0);
-    int ms = ms_past_epoch - seconds_past_epoch*1000;
-    time_t theTime = time(NULL);
-    struct tm *aTime = localtime(&theTime);
-    int hour=aTime->tm_hour;
-    int min=aTime->tm_min;
-    int sec=aTime->tm_sec;
-    std::cout << KGRN << "Received \"" << message << "\" from process " << source <<  ", system time is " << hour <<":"<< (min<10 ? "0" : "") << min <<":"<< (sec<10 ? "0" : "")  << sec <<":"<< (ms<10 ? "00" : (ms < 100 ? "0" : "")) << ms << RST << std::endl;
+    std::cout << KGRN << "Received \"" << message << "\" from process " << source <<  ", system time is " << get_time() << RST << std::endl;
 }
 
 /**
  * Unicast sends a message to the group
  */
-void unicast_send(int dest, std::string message){
+void unicast_send(int dest, const char* message, int len){
     std::unordered_map<unsigned int, struct connection>::const_iterator result = processes.find(dest);
     if(result == processes.end()){
         std::cout << "Error: could not unicast send to non-existent pid" << std::endl;
         return;
     }
-    __int64_t ms_past_epoch = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
-    __int64_t seconds_past_epoch = time(0);
-    int ms = ms_past_epoch - seconds_past_epoch*1000;
-    time_t theTime = time(NULL);
-    struct tm *aTime = localtime(&theTime);
-    int hour=aTime->tm_hour;
-    int min=aTime->tm_min;
-    int sec=aTime->tm_sec;
     struct connection info = result->second;
-    std::cout << KRED << "Sent \"" << message << "\" to process " << dest << ", system time is " << hour <<":"<< (min<10 ? "0" : "") << min <<":"<< (sec<10 ? "0" : "")  << sec <<":"<< (ms<10 ? "00" : (ms < 100 ? "0" : "")) << ms << RST << std::endl;
+    std::cout << KRED << "Sent \"" << message << "\" to process " << dest << ", system time is " << get_time() << RST << std::endl;
     // Send a message with simulated delay
-    std::thread t(delayed_usend, message, info.server_fd);
+    std::thread t(delayed_usend, message, len, info.server_fd);
     t.detach();
 }
 
@@ -291,15 +328,7 @@ void unicast_send(int dest, std::string message){
  * Prints messages as they are delivered
  */
 void delivered(int source, std::string message){
-    __int64_t ms_past_epoch = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
-    __int64_t seconds_past_epoch = time(0);
-    int ms = ms_past_epoch - seconds_past_epoch*1000;
-    time_t theTime = time(NULL);
-    struct tm *aTime = localtime(&theTime);
-    int hour=aTime->tm_hour;
-    int min=aTime->tm_min;
-    int sec=aTime->tm_sec;
-    std::cout << KYEL << "Message \"" << message << "\" from process " << source <<  " delivered. System time is " << hour <<":"<< (min<10 ? "0" : "") << min <<":"<< (sec<10 ? "0" : "")  << sec <<":"<< (ms<10 ? "00" : (ms < 100 ? "0" : "")) << ms << RST << std::endl;
+    std::cout << KYEL << "Message \"" << message << "\" from process " << source <<  " delivered. System time is " << get_time() << RST << std::endl;
 }
 
 /**
@@ -315,22 +344,13 @@ void multicast_receive(int source, std::string message){
  * Sends a sequencer message to the group
  */
 void sequencer_send(int message_id, int pid){
-    __int64_t ms_past_epoch = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
-    __int64_t seconds_past_epoch = time(0);
-    int ms = ms_past_epoch - seconds_past_epoch*1000;
-    time_t theTime = time(NULL);
-    struct tm *aTime = localtime(&theTime);
-    int hour=aTime->tm_hour;
-    int min=aTime->tm_min;
-    int sec=aTime->tm_sec;
-
     std::pair<int, int> entry(message_id, counter);
     decisions[pid-1].insert(entry);
     for(auto x: processes){
         int dest = x.first;
         struct connection info = x.second;
         if(info.server_fd == -1) continue;
-        std::cout << KCYN << "Sent sequence for message " << message_id << " to process " << dest << ", system time is " << hour <<":"<< (min<10 ? "0" : "") << min <<":"<< (sec<10 ? "0" : "")  << sec <<":"<< (ms<10 ? "00" : (ms < 100 ? "0" : "")) << ms << RST << std::endl;
+        std::cout << KCYN << "Sent sequence for message " << message_id << " to process " << dest << ", system time is " << get_time() << RST << std::endl;
         // Send a message with simulated delay
         std::thread t(delayed_sequencer_msend, message_id, info.server_fd, pid);
         t.detach();
@@ -343,15 +363,7 @@ void sequencer_send(int message_id, int pid){
 /**
  * Multicast sends a message to the group
  */
-void multicast_send(std::string message){
-    __int64_t ms_past_epoch = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
-    __int64_t seconds_past_epoch = time(0);
-    int ms = ms_past_epoch - seconds_past_epoch*1000;
-    time_t theTime = time(NULL);
-    struct tm *aTime = localtime(&theTime);
-    int hour=aTime->tm_hour;
-    int min=aTime->tm_min;
-    int sec=aTime->tm_sec;
+void multicast_send(const char * message, int len){
     //Increment this process's timestamp
     processes[process_id].timestamp += 1;
     message_counter+=1;
@@ -359,10 +371,203 @@ void multicast_send(std::string message){
         int dest = x.first;
         struct connection info = x.second;
         if(info.server_fd == -1) continue;
-        std::cout << KRED << "Sent \"" << message << "\" to process " << dest << ", system time is " << hour <<":"<< (min<10 ? "0" : "") << min <<":"<< (sec<10 ? "0" : "")  << sec <<":"<< (ms<10 ? "0" : "") << ms << RST << std::endl;
+        std::cout << KRED << "Sent \"" << message << "\" to process " << dest << ", system time is " << get_time() << RST << std::endl;
         // Send a message with simulated delay
-        std::thread t(delayed_msend, message, info.server_fd);
+        std::thread t(delayed_msend, message, len, info.server_fd);
         t.detach();
+    }
+}
+
+void eventual_send(const char* message, int len, int num_replicas){
+    int i = 0;
+    //Increment this process's timestamp
+    processes[process_id].timestamp += 1;
+    message_counter+=1;
+    for(auto kv : processes){
+        int dest = kv.first;
+        struct connection info = kv.second;
+        if(info.server_fd == -1) continue;
+        std::cout << KRED << "Sent \"" << message << "\" to process " << dest << ", system time is " << get_time() << RST << std::endl;
+        // Send a message with simulated delay
+        std::thread t(delayed_usend, message, len, info.server_fd);
+        t.detach();
+        i+=1;
+        if(i == num_replicas) break;
+    }
+}
+
+void eventual_reply(struct message m){
+    std::cout << m.pid << " " << m.text << " " << m.id << std::endl;
+    struct connection info = processes[m.pid];
+    char* message = new char[2 + 2*sizeof(int) + sizeof(__int64_t)];
+    message[0] = 'R';
+    message[1] = m.text[1];
+    if(dict.find(m.text[1]) == dict.end()){
+        *((int*)(message + 2)) = 0;
+        *((int*)(message + 2 + sizeof(int))) = m.id;
+        *((__int64_t*)(message + 2 + 2*sizeof(int))) = 0;
+    }
+    else {
+        *((int*)(message + 2)) = dict[m.text[1]].value;
+        *((int*)(message + 2 + sizeof(int))) = m.id;
+        *((__int64_t*)(message + 2 + 2*sizeof(int))) = dict[m.text[1]].time;
+    }
+    std::thread t(delayed_usend, message, 2 + 2*sizeof(int) + sizeof(__int64_t), info.server_fd);
+    t.detach();
+}
+
+void kvstore_get(std::string keyname){
+    std::cout << KRED << "GET \"" << keyname << "\", system time is " << get_time() << RST << std::endl;
+    if(is_causally_ordered){
+        ofs << 425 << ',' << process_id << ',' << "get" << ',' << keyname << ',' << get_ms() << ',' << "req" << std::endl;
+    }
+    else
+    {
+        ofs << 425 << ',' << process_id << ',' << "get" << ',' << keyname << ',' << counter << ',' << "req" << std::endl;
+    }
+    char* message = new char[2 + sizeof(int)];
+    message[0] = 'r';
+    message[1] = keyname[0];
+    if(is_causally_ordered){
+        *((int*)(message+2)) = message_counter;
+        struct reply r;
+        r.num = 0;
+        r.value = 0;
+        r.time = 0;
+        std::pair<int, struct reply> entry(message_counter, r);
+        reply_dict.insert(entry);
+        eventual_send(message, 2+sizeof(int), R);
+    }
+    else {
+        multicast_send(message, 2);
+    }
+}
+
+void kvstore_put(std::string keyname, int value){
+    std::cout << KRED << "PUT {\"" << keyname << "\", " << value << "} system time is " << get_time() << RST << std::endl;
+    if(is_causally_ordered){
+        ofs << 425 << ',' << process_id << ',' << "put" << ',' << keyname << ',' << get_ms() << ',' << "req" << ',' << value << std::endl;
+    }
+    else
+    {
+        ofs << 425 << ',' << process_id << ',' << "put" << ',' << keyname << ',' << counter << ',' << "req" << ',' << value << std::endl;
+    }
+    char* message = new char[2 + sizeof(int)];
+    message[0] = 'w';
+    message[1] = keyname[0];
+    *((int*)(message + 2)) = value;
+    *((__int64_t*)(message + 2 + sizeof(int))) = get_ms();
+    if(is_causally_ordered){
+        eventual_send(message, 2+sizeof(int)+sizeof(__int64_t), W);
+    }
+    else {
+        multicast_send(message, 2+sizeof(int));
+    }
+    free(message);
+}
+
+void kvstore_delivered(struct message& m, char* read_bytes, int offset){
+    m.text = m.text.substr(0,2);
+
+    if(m.text[0] == 'w'){
+        m.value = *((int*) (read_bytes+offset+2) );
+        if(is_causally_ordered){
+            m.time = *((__int64_t*) (read_bytes+offset+2+sizeof(int)));
+            delivered(m.pid, "Write(" +  m.text.substr(1,1) + ", " + std::to_string(m.value) + ") at " + std::to_string(m.time));
+        }
+        else{
+            delivered(m.pid, "Write(" +  m.text.substr(1,1) + ", " + std::to_string(m.value) + ")");
+        }
+    }
+    else if (m.text[0] == 'r'){
+        if(is_causally_ordered){
+            m.id = *((int*) (read_bytes+offset+2) );
+            delivered(m.pid, "Read(" +  m.text.substr(1,1) + ")" + " with id " + std::to_string(m.id));
+        }
+        else {
+            delivered(m.pid, "Read(" +  m.text.substr(1,1) + ")");
+        }
+    }
+    else if(m.text[0] == 'R'){
+        m.value = *((int*) (read_bytes+offset+2) );
+        m.id = *((int*) (read_bytes+offset+2+sizeof(int)) );
+        m.time = *((__int64_t*) (read_bytes+offset+2+2*sizeof(int)));
+        std::cout << m.pid << " " << m.text << " " << m.id << " " << m.value << " " << m.time << std::endl;
+        delivered(m.pid, "Reply(" +  m.text.substr(1,1) + "," + std::to_string(m.value) +")" + " with id " + std::to_string(m.id) + " time " + std::to_string(m.time));
+    }
+}
+
+void kvstore_receive(struct message m){
+    if(m.text[0] == 'r'){
+        multicast_receive(m.pid, "Read(" +  m.text.substr(1,1) + ")");
+        //Read from keystore
+        if(dict.find(m.text[1]) == dict.end()){
+            //Handle non-existent case
+            // Print NONE for now
+
+            if(!is_causally_ordered){
+                if(m.pid == process_id){
+                    ofs << 425 << ',' << process_id << ',' << "get" << ',' << m.text[1] << ',' << counter << ',' << "resp" << ',' << 0 << std::endl;
+                }
+            }
+            else {
+                eventual_reply(m);
+            }
+        }
+        else {
+            struct valtime result = dict[m.text[1]];
+            // Ack
+            if(!is_causally_ordered){
+                if(m.pid == process_id){
+                    ofs << 425 << ',' << process_id << ',' << "get" << ',' << m.text[1] << ',' << counter << ',' << "resp" << ',' << result.value << std::endl;
+                }
+            }
+            else {
+                eventual_reply(m);
+            }
+        }
+    }
+    else if (m.text[0] == 'w'){
+        multicast_receive(m.pid, "Write(" +  m.text.substr(1,1) + ", " + std::to_string(m.value) + ")");
+        bool write = false;
+        if(!is_causally_ordered){
+            write = true;
+        }
+        else if(dict.find(m.text[1]) == dict.end()){
+            write = true;
+        }
+        else {
+            write = dict[m.text[1]].time < m.time;
+        }
+        if(write){
+            dict[m.text[1]].value = m.value;
+            if(is_causally_ordered)
+                dict[m.text[1]].time = m.time;
+            // Ack
+            if(m.pid == process_id){
+                if(is_causally_ordered){
+                    dict[m.text[1]].time = m.time;
+                    ofs << 425 << ',' << process_id << ',' << "put" << ',' << m.text[1] << ',' << get_ms() << ',' << "resp" <<  ',' << dict[m.text[1]].value<< std::endl;
+                }
+                else {
+                    ofs << 425 << ',' << process_id << ',' << "put" << ',' << m.text[1] << ',' << counter << ',' << "resp" <<  ',' << dict[m.text[1]].value << std::endl;
+                }
+            }
+        }
+    }
+    else if (m.text[0] == 'R'){
+        if(reply_dict.find(m.id) != reply_dict.end()){
+            reply_dict[m.id].num += 1;
+            if(m.time > reply_dict[m.id].time){
+                reply_dict[m.id].time = m.time;
+                reply_dict[m.id].value = m.value;
+                std::cout << "Updated reply : {" << reply_dict[m.id].num << "," << reply_dict[m.id].value << "," << reply_dict[m.id].time << std::endl;
+            }
+            if(reply_dict[m.id].num == R){
+                ofs << 425 << ',' << process_id << ',' << "get" << ',' << m.text[1] << ',' << get_ms() << ',' << "resp" <<  ',' << reply_dict[m.id].value << std::endl;
+                reply_dict.erase(m.id);
+            }
+        }
     }
 }
 
@@ -433,8 +638,8 @@ void process_fds(){
                     }
 
                     m.text = std::string(read_bytes+sizeof(int)*processes.size());
-                    free(read_bytes);
                     delivered(m.pid, m.text);
+                    free(read_bytes);
                     hold_back_queue.push(m);
                 }
                 else {
@@ -448,17 +653,32 @@ void process_fds(){
                     m.id = id;
 
                     m.text = std::string(read_bytes+sizeof(int));
-                    free(read_bytes);
-                    delivered(m.pid, m.text);
+                    if(kvstore){
+                        kvstore_delivered(m, read_bytes, sizeof(int));
+                    }
+                    else{
+                        delivered(m.pid, m.text);
+                    }
                     if(sequencer) sequencer_send(m.id, m.pid);
                     else hold_back_queue.push(m);
                 }
             }
             else if(protocol == 'u'){
                 // Read the message
-                char buf[read_len];
-                read_all_from_socket(fd, buf, read_len);
-                unicast_receive(fd_info[fd].pid, std::string(buf));
+                if(kvstore){
+                    struct message m;
+                    m.pid = fd_info[fd].pid;
+                    char* read_bytes = new char[read_len];
+                    read_all_from_socket(fd, read_bytes, read_len);
+                    m.text = std::string(read_bytes);
+                    kvstore_delivered(m, read_bytes, 0);
+                    kvstore_receive(m);
+                }
+                else {
+                    char buf[read_len];
+                    read_all_from_socket(fd, buf, read_len);
+                    unicast_receive(fd_info[fd].pid, std::string(buf));
+                }
             }
             else {
                 int pid, id, decision;
@@ -474,6 +694,7 @@ void process_fds(){
         }
     }
 }
+
 
 /**
  * Checks the hold-back queue for any messages that can be received
@@ -502,7 +723,13 @@ void check_queue(){
             }
             if(!failed){
                 delete[] m.V;
-                multicast_receive(m.pid, m.text);
+
+                if(kvstore){
+                    kvstore_receive(m);
+                }
+                else {
+                    multicast_receive(m.pid, m.text);
+                }
             }
             else {
                 hold_back_queue.push(m);
@@ -518,7 +745,12 @@ void check_queue(){
             else {
                 int decision = result->second;
                 if(counter == decision){
-                    multicast_receive(m.pid, m.text);
+                    if(kvstore){
+                        kvstore_receive(m);
+                    }
+                    else {
+                        multicast_receive(m.pid, m.text);
+                    }
                     decisions[m.pid-1].erase(m.id);
                 }
                 else {
@@ -535,8 +767,8 @@ void check_queue(){
  * Checks if there is user input to process and handles it if so
  */
 void process_input(){
-    std::string command, dest_string, message;
-    int destination;
+    std::string command, dest_string, message, keyname, value_string;
+    int value; // Used for scanning integers into (e.g. unicast-send destination, kvstore-get value)
 
     std::string line;
     std::getline( std::cin, line );
@@ -552,27 +784,35 @@ void process_input(){
     if(command.compare("msend") == 0){
         // Must be a multicast send
         message = line.substr(space1_idx + 1, std::string::npos);
-
-        // std::cout << "Command: " << command << std::endl;
-        // std::cout << "Message: " << message << std::endl;
-        multicast_send(message);
+        multicast_send(message.c_str(), message.size());
+    }
+    else if(command.compare("send") == 0){
+        //Assume it's a unicast send
+        dest_string = line.substr(space1_idx+1, space2_idx-space1_idx-1);
+        message = line.substr(space2_idx + 1, std::string::npos);
+        sscanf(dest_string.c_str(), "%d", &value);
+        unicast_send(value, message.c_str(), message.size());
+    }
+    else if(command.compare("get") == 0){
+        keyname = line.substr(space1_idx + 1, std::string::npos);
+        kvstore_get(keyname);
+    }
+    else if(command.compare("put") == 0){
+        keyname = line.substr(space1_idx+1, space2_idx-space1_idx-1);
+        value_string = line.substr(space2_idx + 1, std::string::npos);
+        sscanf(value_string.c_str(), "%d", &value);
+        kvstore_put(keyname, value);
+    }
+    else if(command.compare("delay") == 0){
+        value_string = line.substr(space1_idx + 1, std::string::npos);
+        sscanf(value_string.c_str(), "%d", &value);
+        delay(value);
+    }
+    else if(command.compare("dump") == 0){
+        dump();
     }
     else {
-        //Assume it's a unicast send
-        command = line.substr(0, space1_idx);
-        dest_string = line.substr(space1_idx+1, space2_idx-space1_idx);
-        message = line.substr(space2_idx + 1, std::string::npos);
-        sscanf(dest_string.c_str(), "%d", &destination);
-
-        // std::cout << "Command: " << command << std::endl;
-        // std::cout << "Destination: " << destination << std::endl;
-        // std::cout << "Message: " << message << std::endl;
-        if(command.compare("send") == 0){
-            unicast_send(destination, message);
-        }
-        else {
-            std::cout << "Error: invalid command!" << std::endl;
-        }
+        std::cout << "Error: invalid command!" << std::endl;
     }
 
 }
@@ -609,11 +849,23 @@ void close_process(int sig){
  *  Runs the program
  */
 int main(int argc, char **argv) {
+    std::string filename = "log"+std::string(argv[1])+".txt";
+    ofs = std::ofstream(filename.c_str(), std::ofstream::trunc);
     if(argc >= 3){
         std::cout << "Starting process with id " << argv[1] << " using " << argv[2] << " ordering." << std::endl;
         std::string protocol = argv[2];
         if(protocol.compare("causal") == 0){
             is_causally_ordered = true;
+        }
+        else if(protocol.compare("linearizable") == 0){
+            kvstore = true;
+            is_causally_ordered = false;
+        }
+        else if(protocol.compare("eventual") == 0){
+            kvstore = true;
+            is_causally_ordered = true;
+            sscanf(argv[3], "%d", &R);
+            sscanf(argv[4], "%d", &W);
         }
         else {
             is_causally_ordered = false;
@@ -622,7 +874,7 @@ int main(int argc, char **argv) {
     else {
         std::cout << "Starting process with id " << argv[1] << std::endl;
     }
-    if(argc == 4){
+    if(argc == 4 && !is_causally_ordered){
         sequencer = true;
     }
     sscanf(argv[1], "%d", &process_id);
