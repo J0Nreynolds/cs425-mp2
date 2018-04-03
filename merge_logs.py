@@ -11,7 +11,7 @@ for i in range(1,8):
             log_tuples.append(tuple(line.split(',')))
 
 
-sorted_tuples = sorted(log_tuples,key=lambda tup: tup[4])
+sorted_tuples = sorted(log_tuples,key=lambda tup: int(tup[4]))
 
 with open ('logs.txt', 'a') as logs:
     for tup in sorted_tuples:
