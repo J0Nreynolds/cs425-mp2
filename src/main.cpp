@@ -245,6 +245,9 @@ void delay(int delay){
     std::this_thread::sleep_for(std::chrono::milliseconds(delay));
 }
 
+/**
+ * Prints the contents of the key-value store to standard out
+ */
 void dump(){
     for(auto kv : dict){
         char key = kv.first;
@@ -253,6 +256,9 @@ void dump(){
     }
 }
 
+/**
+ * Returns a string representing the current time in hrs:min:sec:ms
+ */
 std::string get_time(){
     __int64_t ms_past_epoch = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
     __int64_t seconds_past_epoch = time(0);
@@ -268,6 +274,9 @@ std::string get_time(){
     return oss.str();
 }
 
+/**
+ * Returns the number of ms since the beginning of execution
+ */
 __int64_t get_ms(){
     __int64_t ms_past_epoch = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
     return ms_past_epoch - ms_start;
@@ -376,6 +385,9 @@ void multicast_send(const char * message, int len){
     }
 }
 
+/**
+ * The multicast method used for eventual-consistency read and write messages
+ */
 void eventual_send(const char* message, int len, int num_replicas){
     int i = 0;
     //Increment this process's timestamp
@@ -398,6 +410,9 @@ void eventual_send(const char* message, int len, int num_replicas){
     t.detach();
 }
 
+/**
+ * The unicast method used for replying to eventual-consistency read messages
+ */
 void eventual_reply(struct message m){
     std::cout << m.pid << " " << m.text << " " << m.id << std::endl;
     struct connection info = processes[m.pid];
@@ -418,19 +433,24 @@ void eventual_reply(struct message m){
     t.detach();
 }
 
+/**
+ * Issue a GET command to the distributed key-value store
+ */
 void kvstore_get(std::string keyname){
     std::cout << KRED << "GET \"" << keyname << "\", system time is " << get_time() << RST << std::endl;
     if(is_causally_ordered){
+        // Log beginning of GET request
         ofs << 425 << ',' << process_id << ',' << "get" << ',' << keyname << ',' << get_ms() << ',' << "req" << std::endl;
     }
     else
-    {
+    {   // Log beginning of GET request
         ofs << 425 << ',' << process_id << ',' << "get" << ',' << keyname << ',' << counter << ',' << "req" << std::endl;
     }
+    // Create message
     char* message = new char[2 + sizeof(int)];
     message[0] = 'r';
     message[1] = keyname[0];
-    if(is_causally_ordered){
+    if(is_causally_ordered){ // If we're using eventual
         *((int*)(message+2)) = message_counter;
         struct reply r;
         r.num = 0;
@@ -445,21 +465,26 @@ void kvstore_get(std::string keyname){
     }
 }
 
+/**
+ * Issue a PUT command to the distributed key-value store
+ */
 void kvstore_put(std::string keyname, int value){
     std::cout << KRED << "PUT {\"" << keyname << "\", " << value << "} system time is " << get_time() << RST << std::endl;
-    if(is_causally_ordered){
+    if(is_causally_ordered){ // If we're using eventual
+        // Log beginning of PUT request
         ofs << 425 << ',' << process_id << ',' << "put" << ',' << keyname << ',' << get_ms() << ',' << "req" << ',' << value << std::endl;
     }
-    else
-    {
+    else {
+        // Log beginning of PUT request
         ofs << 425 << ',' << process_id << ',' << "put" << ',' << keyname << ',' << counter << ',' << "req" << ',' << value << std::endl;
     }
+    // Create message
     char* message = new char[2 + sizeof(int)];
     message[0] = 'w';
     message[1] = keyname[0];
     *((int*)(message + 2)) = value;
     *((__int64_t*)(message + 2 + sizeof(int))) = get_ms();
-    if(is_causally_ordered){
+    if(is_causally_ordered){ // If we're using eventual
         eventual_send(message, 2+sizeof(int)+sizeof(__int64_t), W);
     }
     else {
@@ -468,6 +493,9 @@ void kvstore_put(std::string keyname, int value){
     free(message);
 }
 
+/**
+ * Fill message member values and print delivery messages to standard out
+ */
 void kvstore_delivered(struct message& m, char* read_bytes, int offset){
     m.text = m.text.substr(0,2);
 
@@ -499,14 +527,15 @@ void kvstore_delivered(struct message& m, char* read_bytes, int offset){
     }
 }
 
+/**
+ * Handle message receivals and print receival messages to standard out
+ */
 void kvstore_receive(struct message m){
     if(m.text[0] == 'r'){
         multicast_receive(m.pid, "Read(" +  m.text.substr(1,1) + ")");
         //Read from keystore
         if(dict.find(m.text[1]) == dict.end()){
             //Handle non-existent case
-            // Print NONE for now
-
             if(!is_causally_ordered){
                 if(m.pid == process_id){
                     ofs << 425 << ',' << process_id << ',' << "get" << ',' << m.text[1] << ',' << counter << ',' << "resp" << ',' << 0 << std::endl;
