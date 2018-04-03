@@ -77,6 +77,7 @@ struct reply {
     __int64_t time;
 };
 std::unordered_map<int, struct reply> reply_dict;
+__int64_t ms_start = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
 
 
 /**
@@ -240,9 +241,6 @@ void delayed_msend(const char* cstr_message, int len, int fd)
     delete[] formatted_message;
 }
 
-void simulate_delay(int delay){
-}
-
 void delay(int delay){
     std::this_thread::sleep_for(std::chrono::milliseconds(delay));
 }
@@ -272,7 +270,7 @@ std::string get_time(){
 
 __int64_t get_ms(){
     __int64_t ms_past_epoch = std::chrono::duration_cast< std::chrono::milliseconds >(std::chrono::system_clock::now().time_since_epoch()).count();
-    return ms_past_epoch;
+    return ms_past_epoch - ms_start;
 }
 
 /**
@@ -383,8 +381,6 @@ void eventual_send(const char* message, int len, int num_replicas){
     //Increment this process's timestamp
     processes[process_id].timestamp += 1;
     message_counter+=1;
-    std::thread t(delayed_usend, message, len, processes[process_id].server_fd);
-    t.detach();
     num_replicas-=1;
     for(auto kv : processes){
         int dest = kv.first;
@@ -398,6 +394,8 @@ void eventual_send(const char* message, int len, int num_replicas){
         i+=1;
         if(i == num_replicas) break;
     }
+    std::thread t(delayed_usend, message, len, processes[process_id].server_fd);
+    t.detach();
 }
 
 void eventual_reply(struct message m){
